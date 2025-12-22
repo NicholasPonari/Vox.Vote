@@ -1,0 +1,254 @@
+"use client";
+
+import React, {
+	createContext,
+	useContext,
+	useEffect,
+	useMemo,
+	useRef,
+	useState,
+	ReactNode,
+} from "react";
+import { Session, User } from "@supabase/supabase-js";
+import { createClient } from "@/lib/supabaseClient";
+import { UserProfile } from "@/lib/types/db";
+
+interface AuthContextType {
+	user: User | null;
+	session: Session | null;
+	profile: UserProfile | null;
+	loading: boolean;
+	isMember: boolean;
+	signOut: () => Promise<void>;
+	setSession: (session: Session | null) => void;
+	refreshProfile: () => Promise<void>;
+}
+
+const AuthContext = createContext<AuthContextType | undefined>(undefined);
+
+export const AuthProvider = ({ children }: { children: ReactNode }) => {
+	const [user, setUser] = useState<User | null>(null);
+	const [session, setSession] = useState<Session | null>(null);
+	const [profile, setProfile] = useState<UserProfile | null>(null);
+	const [loading, setLoading] = useState(true);
+	// Memoize the client to avoid creating a new instance on every render
+	const supabase = useMemo(() => createClient(), []);
+	const profileFetchGuardRef = useRef<{
+		userId: string | null;
+		inFlight: boolean;
+		lastStartedAt: number;
+	}>({ userId: null, inFlight: false, lastStartedAt: 0 });
+
+	// Check if user is a "Member" type (has restrictions)
+	const isMember = profile?.type?.toLowerCase() === "member";
+
+	const fetchProfile = async (userId: string, timeoutMs: number = 15000) => {
+		const now = Date.now();
+		const guard = profileFetchGuardRef.current;
+		if (guard.inFlight && guard.userId === userId) {
+			return;
+		}
+		if (guard.userId === userId && now - guard.lastStartedAt < 1000) {
+			return;
+		}
+		profileFetchGuardRef.current = {
+			userId,
+			inFlight: true,
+			lastStartedAt: now,
+		};
+
+		const profilePromise = supabase
+			.from("profiles")
+			.select(
+				`id, 
+				username, 
+				type, 
+				verified, 
+				avatar_url, 
+				coord, 
+				bookmarks,
+				federal_district_id,
+				municipal_district_id,
+				provincial_district_id,
+				federal_districts (
+					name_en,
+					name_fr
+				),
+				municipal_districts (
+					name,
+					city,
+					borough
+				),
+				provincial_districts (
+					name,
+					province
+				)`
+			)
+			.eq("id", userId)
+			.single();
+
+		const timeoutPromise = new Promise<never>((_, reject) =>
+			setTimeout(() => reject(new Error("Profile fetch timeout")), timeoutMs)
+		);
+
+		try {
+			const { data, error } = await Promise.race([
+				profilePromise,
+				timeoutPromise,
+			]);
+
+			if (data) {
+				// Transform the data to match UserProfile interface
+				// The join returns arrays or single objects depending on relationship, but usually single for FK
+				// We need to cast or map it correctly if Supabase types aren't inferred perfectly here
+				const rawData = data as any;
+
+				// Ensure coord is parsed if it comes as string (though select should handle JSON)
+				let coord = rawData.coord;
+				if (typeof coord === "string") {
+					try {
+						coord = JSON.parse(coord);
+					} catch (e) {
+						coord = null;
+					}
+				}
+
+				const profileData: UserProfile = {
+					id: rawData.id,
+					username: rawData.username,
+					type: rawData.type,
+					verified: rawData.verified,
+					avatar_url: rawData.avatar_url,
+					coord: coord,
+					bookmarks: rawData.bookmarks,
+					federal_district_id: rawData.federal_district_id,
+					municipal_district_id: rawData.municipal_district_id,
+					provincial_district_id: rawData.provincial_district_id,
+					// Handle the joined data - supabase-js usually returns it nested as the table name
+					federal_district: Array.isArray(rawData.federal_districts)
+						? rawData.federal_districts[0]
+						: rawData.federal_districts,
+					municipal_district: Array.isArray(rawData.municipal_districts)
+						? rawData.municipal_districts[0]
+						: rawData.municipal_districts,
+					provincial_district: Array.isArray(rawData.provincial_districts)
+						? rawData.provincial_districts[0]
+						: rawData.provincial_districts,
+				};
+
+				setProfile(profileData);
+			}
+		} catch (err) {
+		} finally {
+			profileFetchGuardRef.current = {
+				...profileFetchGuardRef.current,
+				inFlight: false,
+			};
+		}
+	};
+
+	const refreshProfile = async () => {
+		if (user?.id) {
+			await fetchProfile(user.id);
+		}
+	};
+
+	useEffect(() => {
+		let isMounted = true;
+
+		const loadSession = async () => {
+			try {
+				const sessionPromise = supabase.auth.getSession();
+				const timeoutPromise = new Promise<never>((_, reject) =>
+					setTimeout(() => reject(new Error("getSession timeout")), 15000)
+				);
+				const { data, error } = await Promise.race([
+					sessionPromise,
+					timeoutPromise,
+				]);
+				if (error) {
+				}
+
+				if (!isMounted) {
+					return;
+				}
+
+				setSession(data.session);
+				setUser(data.session?.user ?? null);
+				if (data.session?.user?.id) {
+					await fetchProfile(data.session.user.id);
+				}
+			} catch (error) {
+				if (!isMounted) return;
+				if (error instanceof Error && error.message === "getSession timeout") {
+					return;
+				}
+				setSession(null);
+				setUser(null);
+				setProfile(null);
+			} finally {
+				if (isMounted) {
+					setLoading(false);
+				}
+			}
+		};
+
+		loadSession();
+
+		const { data: listener } = supabase.auth.onAuthStateChange(
+			async (event, nextSession) => {
+				try {
+					setSession(nextSession);
+					setUser(nextSession?.user ?? null);
+					if (nextSession?.user?.id) {
+						await fetchProfile(nextSession.user.id);
+					} else {
+						setProfile(null);
+					}
+				} catch (error) {
+				} finally {
+					setLoading(false);
+				}
+			}
+		);
+
+		return () => {
+			isMounted = false;
+			listener.subscription.unsubscribe();
+		};
+	}, [supabase]);
+
+	const signOut = async () => {
+		setLoading(true);
+		try {
+			await supabase.auth.signOut();
+		} finally {
+			setLoading(false);
+		}
+	};
+
+	return (
+		<AuthContext.Provider
+			value={{
+				user,
+				session,
+				profile,
+				loading,
+				isMember,
+				signOut,
+				setSession,
+				refreshProfile,
+			}}
+		>
+			{children}
+		</AuthContext.Provider>
+	);
+};
+
+export const useAuth = () => {
+	const context = useContext(AuthContext);
+	if (context === undefined) {
+		throw new Error("useAuth must be used within an AuthProvider");
+	}
+	return context;
+};
